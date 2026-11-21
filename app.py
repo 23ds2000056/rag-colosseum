@@ -1,22 +1,20 @@
 import json
-import os
 import re
 
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import SentenceTransformer
 
 KB_FILE = "knowledge_base.json"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 
 with open(KB_FILE, "r", encoding="utf-8") as file:
     passages = json.load(file)
 
-passage_ids = [int(passage["id"]) for passage in passages]
-passage_texts = [passage["text"] for passage in passages]
+passage_ids = [int(p["id"]) for p in passages]
+passage_texts = [p["text"] for p in passages]
 
 embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 passage_embeddings = embedding_model.encode(
@@ -24,8 +22,6 @@ passage_embeddings = embedding_model.encode(
     normalize_embeddings=True,
     convert_to_numpy=True,
 )
-
-reranker = CrossEncoder(RERANKER_MODEL)
 
 app = FastAPI(title="RAG Colosseum")
 
@@ -127,7 +123,7 @@ def is_prompt_injection(question: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in INJECTION_PATTERNS)
 
 
-def abstain_response() -> dict:
+def abstain_response():
     return {
         "answer": None,
         "sources": [],
@@ -136,11 +132,7 @@ def abstain_response() -> dict:
     }
 
 
-def normalize_reranker_score(score: float) -> float:
-    return round(min(1.0, max(0.0, (score + 10.0) / 20.0)), 4)
-
-
-def extract_answer(question: str, passage: str) -> str | None:
+def extract_answer(question: str, passage: str):
     question_lower = question.lower()
 
     for pattern in FACTUAL_PATTERNS:
@@ -178,10 +170,7 @@ def extract_answer(question: str, passage: str) -> str | None:
             best_score = score
             best_sentence = sentence
 
-    if best_sentence:
-        return best_sentence.strip()
-
-    return None
+    return best_sentence.strip() if best_sentence else None
 
 
 @app.post("/query")
@@ -199,53 +188,30 @@ def query(request: QueryRequest):
         convert_to_numpy=True,
     )[0]
 
-    cosine_scores = passage_embeddings @ question_embedding
+    scores = passage_embeddings @ question_embedding
+    ranked = np.argsort(scores)[::-1][:top_k]
 
-    # Retrieve more candidates than needed, then rerank them.
-    candidate_count = min(12, len(passage_texts))
-    candidate_indices = np.argsort(cosine_scores)[::-1][:candidate_count]
+    sources = [passage_ids[i] for i in ranked]
+    passage_scores = [round(float(scores[i]), 4) for i in ranked]
 
-    pairs = [(question, passage_texts[index]) for index in candidate_indices]
-    reranker_scores = reranker.predict(pairs)
+    best_score = passage_scores[0]
+    second_score = passage_scores[1] if len(passage_scores) > 1 else 0.0
 
-    ranked_candidates = np.argsort(reranker_scores)[::-1][:top_k]
-
-    sources = [passage_ids[candidate_indices[index]] for index in ranked_candidates]
-    raw_scores = [float(reranker_scores[index]) for index in ranked_candidates]
-    normalized_scores = [normalize_reranker_score(score) for score in raw_scores]
-
-    best_score = raw_scores[0]
-    second_score = raw_scores[1] if len(raw_scores) > 1 else -100.0
-
-    # Abstain when the reranker has little confidence.
-    if best_score < -3.0:
+    # Be permissive: answer unless retrieval is clearly bad.
+    if best_score < 0.30:
         return abstain_response()
 
-    # Abstain when the top two passages are too close to distinguish.
-    if best_score - second_score < 0.5:
-        return abstain_response()
-
-    # Abstain when the question is too vague.
-    meaningful_words = [
-        word
-        for word in re.findall(r"[A-Za-z][A-Za-z0-9+\-.]*", question.lower())
-        if word not in STOPWORDS
-    ]
-
-    if len(meaningful_words) < 2:
-        return abstain_response()
-
-    answer = extract_answer(question, passage_texts[candidate_indices[ranked_candidates[0]]])
+    answer = extract_answer(question, passage_texts[ranked[0]])
 
     if not answer:
         return abstain_response()
 
-    confidence = min(0.98, max(0.0, (best_score + 5.0) / 10.0))
+    confidence = min(0.98, max(0.0, (best_score - 0.20) / 0.60))
 
     return {
         "answer": answer,
         "sources": sources,
-        "scores": normalized_scores,
+        "scores": passage_scores,
         "confidence": round(confidence, 4),
     }
 
